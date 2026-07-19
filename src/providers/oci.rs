@@ -12,14 +12,14 @@ use tracing::{debug, error, instrument};
 use crate::{Provider, ProviderId};
 
 const METADATA_URI: &str = "http://169.254.169.254";
-const METADATA_PATH: &str = "/opc/v1/instance/metadata/";
+const METADATA_PATH_V1: &str = "/opc/v1/instance/";
+const METADATA_PATH_V2: &str = "/opc/v2/instance/";
 const VENDOR_FILE: &str = "/sys/class/dmi/id/chassis_asset_tag";
 pub(crate) const IDENTIFIER: ProviderId = ProviderId::OCI;
 
 #[derive(Serialize, Deserialize)]
 struct MetadataResponse {
-    #[serde(rename = "oke-tm")]
-    oke_tm: String,
+    id: String,
 }
 
 pub(crate) struct Oci;
@@ -35,7 +35,12 @@ impl Provider for Oci {
     async fn identify(&self, tx: Sender<ProviderId>, timeout: Duration) {
         debug!("Checking Oracle Cloud Infrastructure");
         if self.check_vendor_file(VENDOR_FILE).await
-            || self.check_metadata_server(METADATA_URI, timeout).await
+            || self
+                .check_metadata_server_imdsv2(METADATA_URI, timeout)
+                .await
+            || self
+                .check_metadata_server_imdsv1(METADATA_URI, timeout)
+                .await
         {
             debug!("Identified Oracle Cloud Infrastructure");
             let res = tx.send(IDENTIFIER).await;
@@ -48,10 +53,43 @@ impl Provider for Oci {
 }
 
 impl Oci {
-    /// Tries to identify OCI via metadata server.
+    /// Tries to identify OCI via metadata server (using IMDSv2).
     #[instrument(skip_all)]
-    async fn check_metadata_server(&self, metadata_uri: &str, timeout: Duration) -> bool {
-        let url = format!("{metadata_uri}{METADATA_PATH}");
+    async fn check_metadata_server_imdsv2(&self, metadata_uri: &str, timeout: Duration) -> bool {
+        let url = format!("{metadata_uri}{METADATA_PATH_V2}");
+        debug!("Checking {} metadata using url: {}", IDENTIFIER, url);
+
+        let client = if let Ok(client) = reqwest::Client::builder().timeout(timeout).build() {
+            client
+        } else {
+            error!("Error creating client");
+            return false;
+        };
+
+        match client
+            .get(url)
+            .header("Authorization", "Bearer Oracle")
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json::<MetadataResponse>().await {
+                Ok(resp) => resp.id.starts_with("ocid1.instance."),
+                Err(err) => {
+                    debug!("Error reading response: {:?}", err);
+                    false
+                }
+            },
+            Err(err) => {
+                debug!("Error making request: {:?}", err);
+                false
+            }
+        }
+    }
+
+    /// Tries to identify OCI via metadata server (using IMDSv1).
+    #[instrument(skip_all)]
+    async fn check_metadata_server_imdsv1(&self, metadata_uri: &str, timeout: Duration) -> bool {
+        let url = format!("{metadata_uri}{METADATA_PATH_V1}");
         debug!("Checking {} metadata using url: {}", IDENTIFIER, url);
 
         let client = if let Ok(client) = reqwest::Client::builder().timeout(timeout).build() {
@@ -63,7 +101,7 @@ impl Oci {
 
         match client.get(url).send().await {
             Ok(resp) => match resp.json::<MetadataResponse>().await {
-                Ok(resp) => resp.oke_tm.contains("oke"),
+                Ok(resp) => resp.id.starts_with("ocid1.instance."),
                 Err(err) => {
                     debug!("Error reading response: {:?}", err);
                     false
@@ -105,17 +143,18 @@ mod tests {
 
     use anyhow::Result;
     use tempfile::NamedTempFile;
-    use wiremock::matchers::path;
+    use wiremock::matchers::{header, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
 
     #[tokio::test]
-    async fn test_check_metadata_server_success() {
+    async fn test_check_metadata_server_imdsv2_success() {
         let mock_server = MockServer::start().await;
-        Mock::given(path(METADATA_PATH))
+        Mock::given(path(METADATA_PATH_V2))
+            .and(header("Authorization", "Bearer Oracle"))
             .respond_with(ResponseTemplate::new(200).set_body_json(MetadataResponse {
-                oke_tm: "oke".to_string(),
+                id: "ocid1.instance.oc1.phx.123abc".to_string(),
             }))
             .expect(1)
             .mount(&mock_server)
@@ -124,18 +163,18 @@ mod tests {
         let provider = Oci;
         let metadata_uri = mock_server.uri();
         let result = provider
-            .check_metadata_server(&metadata_uri, Duration::from_secs(1))
+            .check_metadata_server_imdsv2(&metadata_uri, Duration::from_secs(1))
             .await;
 
         assert!(result);
     }
 
     #[tokio::test]
-    async fn test_check_metadata_server_failure() {
+    async fn test_check_metadata_server_imdsv2_failure() {
         let mock_server = MockServer::start().await;
-        Mock::given(path(METADATA_PATH))
+        Mock::given(path(METADATA_PATH_V2))
             .respond_with(ResponseTemplate::new(200).set_body_json(MetadataResponse {
-                oke_tm: "abc".to_string(),
+                id: "i-notoracle".to_string(),
             }))
             .expect(1)
             .mount(&mock_server)
@@ -144,7 +183,47 @@ mod tests {
         let provider = Oci;
         let metadata_uri = mock_server.uri();
         let result = provider
-            .check_metadata_server(&metadata_uri, Duration::from_secs(1))
+            .check_metadata_server_imdsv2(&metadata_uri, Duration::from_secs(1))
+            .await;
+
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_check_metadata_server_imdsv1_success() {
+        let mock_server = MockServer::start().await;
+        Mock::given(path(METADATA_PATH_V1))
+            .respond_with(ResponseTemplate::new(200).set_body_json(MetadataResponse {
+                id: "ocid1.instance.oc1.phx.123abc".to_string(),
+            }))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = Oci;
+        let metadata_uri = mock_server.uri();
+        let result = provider
+            .check_metadata_server_imdsv1(&metadata_uri, Duration::from_secs(1))
+            .await;
+
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_check_metadata_server_imdsv1_failure() {
+        let mock_server = MockServer::start().await;
+        Mock::given(path(METADATA_PATH_V1))
+            .respond_with(ResponseTemplate::new(200).set_body_json(MetadataResponse {
+                id: "i-notoracle".to_string(),
+            }))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = Oci;
+        let metadata_uri = mock_server.uri();
+        let result = provider
+            .check_metadata_server_imdsv1(&metadata_uri, Duration::from_secs(1))
             .await;
 
         assert!(!result);
